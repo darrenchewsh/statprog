@@ -1,0 +1,515 @@
+setwd() # Set working directory to file name "Acqua Signorile" 
+
+install.packages(readr)
+install.packages(dpylr)
+install.packages(qdapTools)
+install.packages(mltools)
+install.packages(data.table)
+install.packages(leaps)
+install.packages(forecast)
+
+library(readr)
+library(dplyr)
+library(qdapTools)
+library(mltools)
+library(data.table) 
+library(leaps)
+library(forecast)
+
+signorile.raw = read_csv("signoriletptclm.csv",
+                         col_types = cols(JOURNEY.STR = col_time(format = "%H:%M:%S")))
+View(signorile.raw)
+
+# Assess data characteristics
+str(signorile.raw)
+
+# Test for rows with incomplete data
+sum(is.na (signorile.raw)) # Number of rows detected = 14,043
+
+# To omit rows with missing values
+signorile.clean <- na.omit(signorile.raw)
+
+#Selection of variables that are relevant for the analysis
+
+signorile.sel = select(signorile.clean,c("DEPT","CLM.PRO.DT","CLM.PYM.DT","DAY","TYPE","PURP","JOURNEY.STR","CLM.AMT","RISK"))
+
+# Unlisting and converting time to numeric  
+signorile.sel$JOURNEY.STR = as.numeric(unlist(data.frame(signorile.sel$JOURNEY.STR)))
+
+# Calculate the day interval between date of processing travel claim and date of reimbursement of travel claim
+signorile.sel$DAY.INT = as.Date(as.character(signorile.sel$CLM.PYM.DT), format="%d/%m/%y")-
+  as.Date(as.character(signorile.sel$CLM.PRO.DT), format="%d/%m/%y")
+  signorile.sel$DAY.INT<-as.numeric(signorile.sel$DAY.INT)
+
+# Drop the CLM.PRO.DT and CLM.PYM.DT
+signorile.sel = select(signorile.sel,-c("CLM.PRO.DT","CLM.PYM.DT"))
+
+# TO REMOVE LATER
+write.csv(signorile.sel, file = "Signorile.selected.csv",row.names = FALSE)
+
+
+# Variable selection using stepwise regression with three options (backward, forward, both)
+set.seed(1) 
+signorile.index <- sample(c(1:dim(signorile.sel)[1]), dim(signorile.sel)[1]*.6) 
+signorile.train <- signorile.sel[signorile.index,] # RESULTS - N = 67183
+signorile.test <- signorile.sel[-signorile.index,] # RESULTS - N = 44789
+
+risk.mlm <- lm(RISK ~., data = signorile.train)
+summary(risk.mlm)
+
+# backward selection
+risk.mlm.bwe <- step(risk.mlm, direction = "backward")
+summary(risk.mlm.bwe) 
+risk.mlm.bwe.pred <- predict(risk.mlm.bwe, signorile.test)
+accuracy(risk.mlm.bwe.pred, signorile.test$RISK)
+
+# forward selection
+risk.mlm.fws <- step(risk.mlm, direction = "forward")
+summary(risk.mlm.fws)  
+risk.mlm.fws.pred <- predict(risk.mlm.fws, signorile.test)
+accuracy(risk.mlm.fws.pred, signorile.test$RISK)
+
+# stepwise regression
+risk.mlm.swr <- step(risk.mlm, direction = "both")
+summary(risk.mlm.swr)
+risk.mlm.swr.pred <- predict(risk.mlm.swr, signorile.test)
+accuracy(risk.mlm.swr.pred, signorile.test$RISK)
+
+# By comparing RMSE and ME of all 3 models, selected stepwise/forward model.
+
+# One-Hot Encoding Categorical Variables to numerical form
+signorile.ohe<-data.frame(c(signorile.sel[,c("TYPE",
+                                             "PURP",
+                                             "DEPT",
+                                             "DAY")]),
+                           stringsAsFactors = TRUE)
+
+ohe.CLM.TYPE <- one_hot(data.table(signorile.ohe$TYPE),
+                        cols = "auto", sparsifyNAs = FALSE, naCols = FALSE,
+                        dropCols = TRUE, dropUnusedLevels = FALSE)
+colnames(ohe.CLM.TYPE) <- paste("CLM.TYPE", colnames(ohe.CLM.TYPE), sep = ".")
+
+ohe.PUR.CD <- one_hot(data.table(signorile.ohe$PURP),
+                      cols = "auto", sparsifyNAs = FALSE, naCols = FALSE,
+                      dropCols = TRUE, dropUnusedLevels = FALSE)
+colnames(ohe.PUR.CD) <- paste("PUR.CD", colnames(ohe.PUR.CD), sep = ".")
+
+ohe.DE.PT <- one_hot(data.table(signorile.ohe$DEPT),
+                     cols = "auto", sparsifyNAs = FALSE, naCols = FALSE,
+                     dropCols = TRUE, dropUnusedLevels = FALSE)
+colnames(ohe.DE.PT) <- paste("DE.PT", colnames(ohe.DE.PT), sep = ".")
+
+ohe.WK.DAY <- one_hot(data.table(signorile.ohe$DAY),
+                      cols = "auto", sparsifyNAs = FALSE, naCols = FALSE,
+                      dropCols = TRUE, dropUnusedLevels = FALSE)
+colnames(ohe.WK.DAY) <- paste("WK.DAY", colnames(ohe.WK.DAY), sep = ".")
+
+signorile.sel = signorile.sel[,-c(1:4)]
+signorile.sel.ohe <- data.frame(signorile.sel,
+                                ohe.CLM.TYPE,
+                                ohe.PUR.CD,
+                                ohe.DE.PT,
+                                ohe.WK.DAY)
+str(signorile.sel.ohe)
+
+# Drop columns based on forward/stepwise method
+signorile.sel.new <- signorile.sel.ohe[,-c(1,4,5,7,14,23:25)]
+View(signorile.sel.new)
+
+# split new data into training and test sets
+set.seed(1) # set seed for reproducing partition 60-40 split (train-test)
+signorile.index.new <- sample(c(1:dim(signorile.sel.new)[1]), 
+                              dim(signorile.sel.new)[1]*.6) 
+signorile.train.new <- signorile.sel.new[signorile.index,] # RESULTS - N = 67183
+signorile.test.new <- signorile.sel.new[-signorile.index,] # RESULTS - N = 44789
+
+# install and load rpart packages
+install.packages("rpart")
+install.packages("rpart.plot")
+install.packages("caret")
+install.packages("e1071")
+install.packages("pROC")
+install.packages("mltools")
+install.packages("C50")
+
+library(rpart)
+library(rpart.plot)
+library(caret)
+library(e1071)
+library(pROC)
+library(mltools)
+library(C50)
+
+# Run Classification Tree using rpart()
+      signorile.rpart <- rpart(RISK ~., 
+                               data = signorile.train.new,
+                               method = "class")
+      summary(signorile.rpart)
+      
+      # Evaluation for Classification Tree
+      signorile.rpart.pred.test <- predict(signorile.rpart,
+                                           signorile.test.new,
+                                           type = "class")
+      # Generate confusion matrix for test data
+      confusionMatrix(table(signorile.rpart.pred.test,
+                            signorile.test.new$RISK),
+                      positive = "1")
+      
+      # Plot ROC for Classification Tree
+      signorile.rpart.pred.prob <- predict(signorile.rpart,
+                                           signorile.test.new,type = "prob")
+      signorile.rpart.combined <- cbind(signorile.test.new,
+                                        signorile.rpart.pred.prob)
+      par(mar=c(10,5,1,0.5))
+      rpart.ROC <- plot.roc(signorile.rpart.combined$RISK,
+                            signorile.rpart.combined$`1`,
+                            main = "ROC for rpart")
+      print(rpart.ROC) 
+
+# Run Deeper Classification Tree
+      signorile.rpart.deep <- rpart(RISK ~.,
+                                    data = signorile.train.new,
+                                    method = "class",
+                                    cp = 0,
+                                    minsplit = 1) # count number of leaves
+      length(signorile.rpart.deep$frame$var[signorile.rpart.deep$frame$var == "<leaf>"])
+      
+      # Evaluation for Deeper Classification Tree
+      signorile.rpart.deep.pred.test <- predict(signorile.rpart.deep,
+                                                signorile.test.new,
+                                                type = "class")
+      # Generate confusion matrix for test data
+      confusionMatrix(table(signorile.rpart.deep.pred.test,
+                      signorile.test.new$RISK),
+                      positive = "1")
+      
+      # Plot ROC for Deeper Classification Tree
+      signorile.rpart.deep.pred.prob <- predict(signorile.rpart.deep,
+                                                 signorile.test.new, type = "prob")
+      signorile.rpart.deep.combined <- cbind(signorile.test.new,
+                                             signorile.rpart.deep.pred.prob)
+      par(mar=c(10,5,1,0.5))
+      rpart.deep.ROC <- plot.roc(signorile.rpart.deep.combined$RISK,
+                                 signorile.rpart.combined$`1`,
+                                 main = "ROC for rpart deep")
+      print(rpart.deep.ROC) 
+
+
+# load mltools package
+mcc(preds = signorile.rpart.combined$`1`, 
+    actuals = signorile.rpart.combined$RISK) # RESULTS = 0
+
+mcc(preds = signorile.rpart.deep.combined$`1`,
+    actuals = signorile.rpart.deep.combined$RISK) # RESULTS = "cannot allocate vector of size 663.3 Mb
+
+# Pruning using c5.0 algorithm
+signorile.c5 <-C5.0(as.factor(RISK)~., 
+                    data = signorile.train.new)
+summary(signorile.c5)
+plot(signorile.c5)
+
+# C5.0 Decision Rules Set with different trial range
+# trials = 1
+        signorile.c5.rules.1 <- C5.0(as.factor(RISK)~., 
+                                   data = signorile.train.new,
+                                   trials = 1, 
+                                   rules = TRUE,
+                                   weights = NULL)
+        summary(signorile.c5.rules.1)
+        signorile.c5.pred.1 <- predict(signorile.c5.rules.1,
+                                     signorile.test.new,
+                                     type = "class")
+        confusionMatrix(table(signorile.c5.pred.1,
+                              signorile.test.new$RISK),
+                              positive = "1")
+        # Plot ROC for C5.0
+        signorile.c5.rules.1.pred.prob <- predict(signorile.c5.rules.1,
+                                                 signorile.test.new,
+                                                 type = "prob")
+        signorile.c5.rules.1.combined <- cbind(signorile.test.new,
+                                               signorile.c5.rules.1.pred.prob)
+        par(mar=c(10,5,1,0.5))
+        signorile.c5.rules.1.ROC <- plot.roc(signorile.c5.rules.1.combined$RISK,
+                                             signorile.c5.rules.1.combined$`1`,
+                                             main = "ROC for Random Forest")
+        print(signorile.c5.rules.1.ROC) 
+
+# trials = 3
+        signorile.c5.rules.3 <- C5.0(as.factor(RISK)~., 
+                                   data = signorile.train.new,
+                                   trials = 3, 
+                                   rules = TRUE,
+                                   weights = NULL) 
+        summary(signorile.c5.rules.3)
+        signorile.c5.pred.3 <- predict(signorile.c5.rules.3,
+                                       signorile.test.new,
+                                       type = "class")
+        confusionMatrix(table(signorile.c5.pred.3,
+                              signorile.test.new$RISK),
+                        positive = "1")
+        # Plot ROC for trials = 3
+        signorile.c5.rules.3.pred.prob <- predict(signorile.c5.rules.3,
+                                                  signorile.test.new,
+                                                  type = "prob")
+        signorile.c5.rules.3.combined <- cbind(signorile.test.new,
+                                               signorile.c5.rules.3.pred.prob)
+        par(mar=c(10,5,1,0.5))
+        signorile.c5.rules.3.ROC <- plot.roc(signorile.c5.rules.3.combined$RISK,
+                                             signorile.c5.rules.3.combined$`1`,
+                                             main = "ROC for Random Forest")
+        print(signorile.c5.rules.3.ROC) 
+
+# trials = 5
+        signorile.c5.rules.5 <- C5.0(as.factor(RISK)~., 
+                                   data = signorile.train.new,
+                                   trials = 5, 
+                                   rules = TRUE,
+                                   weights = NULL)
+        summary(signorile.c5.rules.5)
+        signorile.c5.pred.5 <- predict(signorile.c5.rules.5,
+                                       signorile.test.new,
+                                       type = "class")
+        confusionMatrix(table(signorile.c5.pred.5,
+                              signorile.test.new$RISK),
+                        positive = "1")
+        # Plot ROC for trials = 5
+        signorile.c5.rules.5.pred.prob <- predict(signorile.c5.rules.5,
+                                                  signorile.test.new,
+                                                  type = "prob")
+        signorile.c5.rules.5.combined <- cbind(signorile.test.new,
+                                               signorile.c5.rules.5.pred.prob)
+        par(mar=c(10,5,1,0.5))
+        signorile.c5.rules.5.ROC <- plot.roc(signorile.c5.rules.5.combined$RISK,
+                                             signorile.c5.rules.5.combined$`1`,
+                                             main = "ROC for Random Forest")
+        print(signorile.c5.rules.5.ROC) 
+
+# trials = 7
+        signorile.c5.rules.7 <- C5.0(as.factor(RISK)~., 
+                                   data = signorile.train.new,
+                                   trials = 7, 
+                                   rules = TRUE,
+                                   weights = NULL)
+        summary(signorile.c5.rules.7)
+        signorile.c5.pred.7 <- predict(signorile.c5.rules.7,
+                                       signorile.test.new,
+                                       type = "class")
+        confusionMatrix(table(signorile.c5.pred.7,
+                              signorile.test.new$RISK),
+                        positive = "1")
+        # Plot ROC for trials = 7
+        signorile.c5.rules.7.pred.prob <- predict(signorile.c5.rules.7,
+                                                  signorile.test.new,
+                                                  type = "prob")
+        signorile.c5.rules.7.combined <- cbind(signorile.test.new,
+                                               signorile.c5.rules.7.pred.prob)
+        par(mar=c(10,5,1,0.5))
+        signorile.c5.rules.7.ROC <- plot.roc(signorile.c5.rules.7.combined$RISK,
+                                             signorile.c5.rules.7.combined$`1`,
+                                             main = "ROC for Random Forest")
+        print(signorile.c5.rules.7.ROC) 
+
+# trials = 10
+        signorile.c5.rules.10 <- C5.0(as.factor(RISK)~., 
+                                     data = signorile.train.new,
+                                     trials = 10, 
+                                     rules = TRUE,
+                                     weights = NULL)
+        summary(signorile.c5.rules.10)
+        signorile.c5.pred.10 <- predict(signorile.c5.rules.10,
+                                       signorile.test.new,
+                                       type = "class")
+        confusionMatrix(table(signorile.c5.pred.10,
+                              signorile.test.new$RISK),
+                        positive = "1")
+        # Plot ROC for trials = 10
+        signorile.c5.rules.10.pred.prob <- predict(signorile.c5.rules.10,
+                                                  signorile.test.new,
+                                                  type = "prob")
+        signorile.c5.rules.10.combined <- cbind(signorile.test.new,
+                                               signorile.c5.rules.10.pred.prob)
+        par(mar=c(10,5,1,0.5))
+        signorile.c5.rules.10.ROC <- plot.roc(signorile.c5.rules.10.combined$RISK,
+                                             signorile.c5.rules.10.combined$`1`,
+                                             main = "ROC for Random Forest")
+        print(signorile.c5.rules.10.ROC) 
+
+# Extract rules of summary output for trials = 7
+write.csv(capture.output(summary(signorile.c5.rules.7)), "c5rules_trials_7.txt")
+
+# on test set
+signorile.c5.pred <- predict(signorile.c5,
+                             signorile.test.new,
+                             type = "class")
+# generate confusion matrix
+confusionMatrix(table(signorile.c5.pred,
+                      signorile.test.new$RISK),
+                      positive = "1")
+
+# Improved decision trees: random forests
+install.packages("randomForest")
+library(randomForest)
+
+# Random forest - ntree = 500
+      signorile.randf.500 <- randomForest(as.factor(RISK)~.,
+                                      data = signorile.train.new,
+                                      ntree = 500,
+                                      mtry = 4,
+                                      nodesize = 5,
+                                      importance = TRUE) 
+      
+      # scoring variable importance
+      varImpPlot(signorile.randf.500, type = 2)
+      
+      # on test set
+      signorile.randf.pred.500 <- predict(signorile.randf.500,
+                                      signorile.test.new, 
+                                      type = "class",
+                                      main = "Variable Importance Plot")
+      # generate confusion matrix
+      confusionMatrix(table(signorile.randf.pred.500,
+                            signorile.test.new$RISK),
+                            positive = "1")
+      
+      # Plot ROC for random forest
+      signorile.randf.pred.prob <- predict(signorile.randf.500,
+                                           signorile.test.new,
+                                           type = "prob")
+      signorile.randf.combined <- cbind(signorile.test.new,
+                                        signorile.randf.pred.prob)
+      par(mar=c(10,5,1,0.5))
+      randf.ROC <- plot.roc(signorile.randf.combined$RISK,
+                            signorile.randf.combined$`1`,
+                            main = "ROC for Random Forest")
+      print(randf.ROC) # Display ROC curve of randf model
+
+
+#Repeating algorithsm with variations ntree = 250/400/600/750
+# Random Forest - ntree = 250
+      signorile.randf.250 <- randomForest(as.factor(RISK)~.,
+                                          data = signorile.train.new,
+                                          ntree = 250,
+                                          mtry = 4,
+                                          nodesize = 5,
+                                          importance = TRUE) 
+      # scoring variable importance
+      varImpPlot(signorile.randf.250, type = 2)
+      
+      # on test set
+      signorile.randf.pred.250 <- predict(signorile.randf.250,
+                                          signorile.test.new, 
+                                          type = "class",
+                                          main = "Variable Importance Plot")
+      # generate confusion matrix
+      confusionMatrix(table(signorile.randf.pred.250,
+                            signorile.test.new$RISK),
+                      positive = "1")
+      # Plot ROC for ntree = 250 random forest
+      signorile.randf.pred.prob.250 <- predict(signorile.randf.250,
+                                               signorile.test.new,
+                                               type = "prob")
+      signorile.randf.combined.250 <- cbind(signorile.test.new,
+                                            signorile.randf.pred.prob.250)
+      par(mar=c(10,5,1,0.5))
+      randf.ROC.250 <- plot.roc(signorile.randf.combined.250$RISK,
+                                signorile.randf.combined.250$`1`,
+                                main = "ROC for Random Forest")
+      print(randf.ROC.250) # Display ROC curve of randf model
+
+
+# Random Forest - ntree = 400
+      signorile.randf.400 <- randomForest(as.factor(RISK)~.,
+                                          data = signorile.train.new,
+                                          ntree = 400,
+                                          mtry = 4,
+                                          nodesize = 5,
+                                          importance = TRUE) 
+      # scoring variable importance
+      varImpPlot(signorile.randf.400, type = 2)
+      
+      # on test set
+      signorile.randf.pred.400 <- predict(signorile.randf.400,
+                                          signorile.test.new, 
+                                          type = "class",
+                                          main = "Variable Importance Plot")
+      # generate confusion matrix
+      confusionMatrix(table(signorile.randf.pred.400,
+                            signorile.test.new$RISK),
+                      positive = "1")
+      # Plot ROC for ntree = 400 random forest
+      signorile.randf.pred.prob.400 <- predict(signorile.randf.400,
+                                           signorile.test.new,
+                                           type = "prob")
+      signorile.randf.combined.400 <- cbind(signorile.test.new,
+                                        signorile.randf.pred.prob.400)
+      par(mar=c(10,5,1,0.5))
+      randf.ROC.400 <- plot.roc(signorile.randf.combined.400$RISK,
+                            signorile.randf.combined.400$`1`,
+                            main = "ROC for Random Forest")
+      print(randf.ROC.400) # Display ROC curve of randf model
+
+
+# Random Forest - ntree = 600
+      signorile.randf.600 <- randomForest(as.factor(RISK)~.,
+                                          data = signorile.train.new,
+                                          ntree = 600,
+                                          mtry = 4,
+                                          nodesize = 5,
+                                          importance = TRUE) 
+      # scoring variable importance
+      varImpPlot(signorile.randf.600, type = 2)
+      
+      # on test set
+      signorile.randf.pred.600 <- predict(signorile.randf.600,
+                                          signorile.test.new, 
+                                          type = "class",
+                                          main = "Variable Importance Plot")
+      # generate confusion matrix
+      confusionMatrix(table(signorile.randf.pred.600,
+                            signorile.test.new$RISK),
+                      positive = "1")
+      # Plot ROC for ntree = 600 random forest
+      signorile.randf.pred.prob.600 <- predict(signorile.randf.600,
+                                               signorile.test.new,
+                                               type = "prob")
+      signorile.randf.combined.600 <- cbind(signorile.test.new,
+                                            signorile.randf.pred.prob.600)
+      par(mar=c(10,5,1,0.5))
+      randf.ROC.600 <- plot.roc(signorile.randf.combined.600$RISK,
+                                signorile.randf.combined.600$`1`,
+                                main = "ROC for Random Forest")
+      print(randf.ROC.600) # Display ROC curve of randf model
+
+
+# Random Forest - ntree = 750
+      signorile.randf.750 <- randomForest(as.factor(RISK)~.,
+                                          data = signorile.train.new,
+                                          ntree = 750,
+                                          mtry = 4,
+                                          nodesize = 5,
+                                          importance = TRUE) 
+      # scoring variable importance
+      varImpPlot(signorile.randf.750, type = 2)
+      
+      # on test set
+      signorile.randf.pred.750 <- predict(signorile.randf.750,
+                                          signorile.test.new, 
+                                          type = "class",
+                                          main = "Variable Importance Plot")
+      # generate confusion matrix
+      confusionMatrix(table(signorile.randf.pred.750,
+                            signorile.test.new$RISK),
+                      positive = "1")
+      
+      # Plot ROC for ntree = 750 random forest
+      signorile.randf.pred.prob.750 <- predict(signorile.randf.750,
+                                               signorile.test.new,
+                                               type = "prob")
+      signorile.randf.combined.750 <- cbind(signorile.test.new,
+                                            signorile.randf.pred.prob.750)
+      par(mar=c(10,5,1,0.5))
+      randf.ROC.750 <- plot.roc(signorile.randf.combined.750$RISK,
+                                signorile.randf.combined.750$`1`,
+                                main = "ROC for Random Forest")
+      print(randf.ROC.750) # Display ROC curve of randf model
+      
